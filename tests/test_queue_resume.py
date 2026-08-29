@@ -35,7 +35,7 @@ class QueueResumeTests(unittest.TestCase):
         return {
             "id": job_id,
             "status": "queued",
-            "stage": "等待语音克隆",
+            "stage": "等待 MiniMax 音色克隆",
             "progress": 1,
             "created_at": 1.0,
             "started_at": 1.0,

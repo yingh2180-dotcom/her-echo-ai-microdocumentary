@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 410" role="img" aria-labelledby="title desc">
+  <title id="title">岁月回忆手绘风开发中占位图</title>
+  <desc id="desc">左侧深灰线稿逐渐过渡为右侧低饱和彩铅插画</desc>
+  <defs>
+    <linearGradient id="paper" x1="0" x2="1">
+      <stop offset="0" stop-color="#f3eee3"/>
+      <stop offset=".52" stop-color="#eee7da"/>
+      <stop offset=".53" stop-color="#d9c7a8"/>
+      <stop offset="1" stop-color="#b9c1a2"/>
+    </linearGradient>
+    <pattern id="grain" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M2 6h5M15 18h6M10 2h2" stroke="#5d584f" stroke-opacity=".10" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="800" height="410" rx="28" fill="url(#paper)"/>
+  <rect width="800" height="410" rx="28" fill="url(#grain)"/>
+  <path d="M82 295c64-42 121-38 188-7 72 34 141 25 206-2 78-32 145-17 244 15" fill="none" stroke="#676158" stroke-width="3" stroke-linecap="round"/>
+  <path d="M110 285v-91m0 34h72m-57 57v-91m43 91v-91" fill="none" stroke="#4f4b45" stroke-width="6" stroke-linecap="round"/>
+  <path d="M566 285v-91m0 34h72m-57 57v-91m43 91v-91" fill="none" stroke="#4f4b45" stroke-width="6" stroke-linecap="round"/>
+  <path d="M184 218c31-13 69-12 103 4l-14 64h-104z" fill="none" stroke="#4a4742" stroke-width="7" stroke-linejoin="round"/>
+  <circle cx="230" cy="155" r="41" fill="#f3eee3" stroke="#4a4742" stroke-width="7"/>
+  <path d="M194 151c8-38 67-48 79-2-20-12-56-11-79 2Zm11 30c13 17 39 20 57 1M216 154c3-3 8-3 11 0m17 0c3-3 8-3 11 0" fill="none" stroke="#4a4742" stroke-width="5" stroke-linecap="round"/>
+  <path d="M640 218c-31-13-69-12-103 4l14 64h104z" fill="#88705e" fill-opacity=".58" stroke="#4a4742" stroke-width="7" stroke-linejoin="round"/>
+  <circle cx="594" cy="155" r="41" fill="#d5aa86" fill-opacity=".70" stroke="#4a4742" stroke-width="7"/>
+  <path d="M558 151c8-38 67-48 79-2-20-12-56-11-79 2Z" fill="#8d8579" stroke="#4a4742" stroke-width="5"/>
+  <path d="M569 181c13 17 39 20 57 1M580 154c3-3 8-3 11 0m17 0c3-3 8-3 11 0" fill="none" stroke="#4a4742" stroke-width="5" stroke-linecap="round"/>
+  <path d="M400 64v278" stroke="#6e675d" stroke-width="3" stroke-dasharray="8 12" opacity=".7"/>
+  <path d="M356 192h88" stroke="#8b4e3f" stroke-width="8" stroke-linecap="round"/>
+  <path d="m428 176 20 16-20 16" fill="none" stroke="#8b4e3f" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <g font-family="Microsoft YaHei, sans-serif" text-anchor="middle">
+    <text x="400" y="356" fill="#4a4742" font-size="25" font-weight="700" letter-spacing="4">线稿 → 低饱和彩色</text>
+    <rect x="326" y="22" width="148" height="42" rx="21" fill="#8b4e3f"/>
+    <text x="400" y="51" fill="#fff8ed" font-size="20" font-weight="700">效果示意</text>
+  </g>
+</svg>

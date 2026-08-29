@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import {fileURLToPath} from 'node:url';
 import {bundle} from '@remotion/bundler';
 import {renderMedia, selectComposition} from '@remotion/renderer';
 
@@ -9,8 +10,9 @@ if (!propsPath || !outputPath || !publicDir) {
   throw new Error('用法：node render.mjs <props.json> <output.mp4> <job-public-dir>');
 }
 
-const rendererRoot = path.dirname(new URL(import.meta.url).pathname.replace(/^\/(.:)/, '$1'));
+const rendererRoot = path.dirname(fileURLToPath(import.meta.url));
 const inputProps = JSON.parse(fs.readFileSync(propsPath, 'utf8'));
+const compositionId = inputProps.compositionId || 'DynamicInfographic';
 const browserCandidates = [
   process.env.REMOTION_BROWSER_EXECUTABLE,
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -28,7 +30,7 @@ const serveUrl = await bundle({
 const rendererOptions = browserExecutable ? {browserExecutable} : {};
 const composition = await selectComposition({
   serveUrl,
-  id: 'DynamicInfographic',
+  id: compositionId,
   inputProps,
   logLevel: 'warn',
   timeoutInMilliseconds: 120000,
@@ -44,7 +46,7 @@ await renderMedia({
   crf: 19,
   pixelFormat: 'yuv420p',
   x264Preset: 'medium',
-  concurrency: '50%',
+  concurrency: compositionId === 'MemoryHanddraw' ? 1 : '50%',
   overwrite: true,
   logLevel: 'warn',
   timeoutInMilliseconds: 120000,

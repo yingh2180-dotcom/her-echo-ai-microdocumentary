@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import mimetypes
@@ -19,38 +20,92 @@ import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from gradio_client import Client, handle_file
+
+try:
+    from webapp.providers.gemini import (
+        GeminiHTTPError,
+        generate_image as gemini_generate_image,
+        generate_text as gemini_generate_text,
+        get_model as gemini_get_model,
+    )
+    from webapp.providers.rightcode import (
+        RightCodeHTTPError,
+        generate_image as rightcode_generate_image,
+        generate_text as rightcode_generate_text,
+        list_models as rightcode_list_models,
+    )
+except ModuleNotFoundError:  # Support running this file directly from webapp/.
+    from providers.gemini import (
+        GeminiHTTPError,
+        generate_image as gemini_generate_image,
+        generate_text as gemini_generate_text,
+        get_model as gemini_get_model,
+    )
+    from providers.rightcode import (
+        RightCodeHTTPError,
+        generate_image as rightcode_generate_image,
+        generate_text as rightcode_generate_text,
+        list_models as rightcode_list_models,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = ROOT / ".webapp"
 JOBS_DIR = STATE_DIR / "jobs"
 CONFIG_PATH = STATE_DIR / "config.json"
+VOICE_CACHE_PATH = STATE_DIR / "minimax_voice_cache.json"
 PREFERENCES_PATH = STATE_DIR / "preferences.json"
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
+REMOTION_MEDIA_DIR = REMOTION_RENDERER / "node_modules" / "@remotion" / "compositor-win32-x64-msvc"
+FFMPEG = shutil.which("ffmpeg") or str(REMOTION_MEDIA_DIR / "ffmpeg.exe")
+FFPROBE = shutil.which("ffprobe") or str(REMOTION_MEDIA_DIR / "ffprobe.exe")
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v8_oil_visual"
+PIPELINE_VERSION = "narrated_deck_v11_memory_remotion"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
+VIDEO_RESULT_FILES = {
+    "final.mp4",
+    "final-remotion-v1.mp4",
+    "final-memory-remotion-v1.mp4",
+}
 
 DEFAULT_CONFIG = {
+    "ai_provider": "openlux",
     "api_key": "",
     "base_url": "https://api.openlux.ai/v1",
     "text_model": "gpt-5",
     "image_model": "gpt-image-2",
-    "tts_url": "http://127.0.0.1:7860",
-    "tts_url_2": "",
-    "tts_mode": "gradio",
+    "gemini_api_key": "",
+    "gemini_text_model": "gemini-3.7-flash",
+    "gemini_image_model": "gemini-3.1-flash-image",
+    "rightcode_api_key": "",
+    "rightcode_text_base_url": "https://www.rightapi.ai/codex/v1",
+    "rightcode_image_base_url": "https://www.rightapi.ai/draw/v1",
+    "rightcode_task_base_url": "https://www.rightapi.ai/v1/tasks",
+    "rightcode_text_model": "gpt-5.5",
+    "rightcode_image_model": "gpt-image-2",
+    "minimax_api_key": "",
+    "minimax_base_url": "https://api.minimaxi.com",
+    "minimax_api_type": "t2a_v2",
+    "minimax_speech_model": "speech-2.8-hd",
+    "minimax_clone_prefix": "csboard",
 }
 
 DEFAULT_STYLE = "极简粗线简笔白板风"
 INFOGRAPHIC_STYLE = "国风动态信息图"
+MEMORY_HANDDRAW_STYLE = "岁月回忆手绘风"
+MEMORY_HANDDRAW_PIPELINE_ENABLED = True
 STYLE_PRESETS = {
     INFOGRAPHIC_STYLE: (
         "暖米白宣纸背景，深灰正文与朱红重点，低饱和靛青辅助色；"
         "固定总标题和章节标题，以知识卡片、关系线、时间轴、层级或对比结构组织观点，"
         "搭配克制的国风淡彩插画，大量留白，成人知识内容，禁止摄影写实和儿童卡通。"
+    ),
+    MEMORY_HANDDRAW_STYLE: (
+        "温暖纸白背景，深灰黑色钢笔线稿清楚、连续且便于提取，低饱和赭石、灰蓝、豆绿与旧玫瑰色像彩铅轻铺；"
+        "保留老人真实年龄、皱纹、发色和生活质感，以成人回忆录的克制镜头表现一段具体记忆。"
+        "构图温暖、复古、留白充足，避免儿童卡通、高饱和、霓虹、塑料 3D、照片写实和厚重油画。"
     ),
     "极简粗线简笔白板风": (
         "暖白色纯净背景，圆润有亲和力的粗黑马克笔轮廓，人物和物体高度概括，"
@@ -229,6 +284,7 @@ WORKER_LOCK = threading.Lock()
 VOICE_WORKER_THREADS: dict[int, threading.Thread] = {}
 VOICE_NODE_JOBS: dict[int, str | None] = {}
 VOICE_NODE_LOCK = threading.Lock()
+VOICE_CACHE_LOCK = threading.Lock()
 MODEL_WORKER_THREADS: list[threading.Thread] = []
 RENDER_THREADS: set[threading.Thread] = set()
 RENDER_THREADS_LOCK = threading.Lock()
@@ -302,6 +358,30 @@ def valid_image_file(path: Path) -> bool:
         return False
 
 
+def aligned_image_pair(color_image: Path, line_image: Path) -> bool:
+    """Return whether two valid images have exactly the same pixel dimensions."""
+    if not valid_image_file(color_image) or not valid_image_file(line_image):
+        return False
+    try:
+        from PIL import Image
+        with Image.open(color_image) as color, Image.open(line_image) as line:
+            return color.size == line.size
+    except Exception:
+        return False
+
+
+def ensure_memory_lineart_asset(style: str, color_image: Path, line_image: Path) -> Path | None:
+    """Create the line-art pair only for the memory template."""
+    if style != MEMORY_HANDDRAW_STYLE:
+        return None
+    from scripts.make_lineart import extract_lineart
+    extract_lineart(color_image, line_image)
+    if not aligned_image_pair(color_image, line_image):
+        line_image.unlink(missing_ok=True)
+        raise RuntimeError("岁月回忆手绘风线稿与彩色母图未能保持像素对齐")
+    return line_image
+
+
 def valid_media_file(path: Path) -> bool:
     if not path.exists() or path.stat().st_size < 1024:
         return False
@@ -358,6 +438,8 @@ def load_config() -> dict[str, Any]:
         data["text_model"] = DEFAULT_CONFIG["text_model"]
     if str(data.get("image_model", "")).startswith("doubao-"):
         data["image_model"] = DEFAULT_CONFIG["image_model"]
+    if data.get("ai_provider") not in {"openlux", "gemini", "rightcode"}:
+        data["ai_provider"] = "openlux"
     return data
 
 
@@ -366,17 +448,46 @@ def safe_config(data: dict[str, Any]) -> dict[str, Any]:
     key = result.get("api_key", "")
     result["api_key"] = "" if not key else f"{key[:4]}••••{key[-4:]}"
     result["has_api_key"] = bool(key)
+    minimax_key = str(result.get("minimax_api_key", ""))
+    result["minimax_api_key"] = "" if not minimax_key else "********"
+    gemini_key = str(result.get("gemini_api_key", ""))
+    result["gemini_api_key"] = "" if not gemini_key else "********"
+    result["has_gemini_api_key"] = bool(gemini_key)
+    rightcode_key = str(result.get("rightcode_api_key", ""))
+    result["rightcode_api_key"] = "" if not rightcode_key else "********"
+    result["has_rightcode_api_key"] = bool(rightcode_key)
+    result["has_minimax_api_key"] = bool(minimax_key)
     return result
 
 
-def configured_tts_nodes(config: dict[str, Any] | None = None) -> list[str]:
+
+
+def configured_voice_services(config: dict[str, Any] | None = None) -> list[str]:
     source = config or load_config()
-    nodes: list[str] = []
-    for key in ("tts_url", "tts_url_2"):
-        url = str(source.get(key, "")).strip().rstrip("/")
-        if url and url not in nodes:
-            nodes.append(url)
-    return nodes
+    url = str(source.get("minimax_base_url", "")).strip().rstrip("/")
+    return [url] if url else []
+
+
+def minimax_headers(config: dict[str, Any]) -> dict[str, str]:
+    api_key = str(config.get("minimax_api_key", "")).strip()
+    if not api_key:
+        raise RuntimeError("MiniMax API key is required")
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def minimax_json(response: httpx.Response, action: str) -> dict[str, Any]:
+    if response.is_error:
+        raise RuntimeError(f"MiniMax {action} failed: HTTP {response.status_code} {response.text[:300]}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"MiniMax {action} returned invalid JSON") from exc
+    base_resp = payload.get("base_resp") or {}
+    status_code = int(base_resp.get("status_code", -1))
+    if status_code != 0:
+        message = str(base_resp.get("status_msg") or "unknown error")
+        raise RuntimeError(f"MiniMax {action} failed: {status_code} {message}")
+    return payload
 
 
 def normalized_task_name(value: Any, script: str = "", job_id: str = "") -> str:
@@ -503,6 +614,12 @@ def job_snapshot(job_id: str) -> dict[str, Any]:
             for path in (JOBS_DIR / job_id).glob("board-*.png")
             if re.fullmatch(r"board-\d+\.png", path.name)
         )
+        if source.get("style") == MEMORY_HANDDRAW_STYLE:
+            result["lineart_count"] = sum(
+                1
+                for path in (JOBS_DIR / job_id).glob("board-*.line.png")
+                if re.fullmatch(r"board-\d+\.line\.png", path.name)
+            )
         if (
             source.get("status") == "done"
             and result["image_count"]
@@ -590,7 +707,7 @@ def run(cmd: list[str], cwd: Path = ROOT, job_id: str | None = None) -> None:
 
 def probe_duration(path: Path) -> float:
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nk=1:nw=1", str(path)],
+        [str(FFPROBE), "-v", "error", "-show_entries", "format=duration", "-of", "default=nk=1:nw=1", str(path)],
         capture_output=True,
         text=True,
         check=True,
@@ -678,6 +795,168 @@ def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
         payload = response.json()
     return {str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")}
 
+def selected_ai_provider(config: dict[str, Any]) -> str:
+    provider = str(config.get("ai_provider", "openlux")).strip().lower()
+    return provider if provider in {"openlux", "gemini", "rightcode"} else "openlux"
+
+
+def provider_job_snapshot(config: dict[str, Any]) -> dict[str, str]:
+    provider = selected_ai_provider(config)
+    model_prefix = "gemini" if provider == "gemini" else "rightcode" if provider == "rightcode" else ""
+    return {
+        "ai_provider": provider,
+        "provider_text_model": str(config.get(f"{model_prefix}_text_model" if model_prefix else "text_model", "")),
+        "provider_image_model": str(config.get(f"{model_prefix}_image_model" if model_prefix else "image_model", "")),
+    }
+
+
+def model_config_for_job(job_id: str) -> dict[str, Any]:
+    config = load_config()
+    with LOCK:
+        job = JOBS.get(job_id, {}).copy()
+    provider = str(job.get("ai_provider") or "")
+    if provider not in {"openlux", "gemini", "rightcode"}:
+        return config
+    config["ai_provider"] = provider
+    if provider == "gemini":
+        config["gemini_text_model"] = str(job.get("provider_text_model") or config["gemini_text_model"])
+        config["gemini_image_model"] = str(job.get("provider_image_model") or config["gemini_image_model"])
+    elif provider == "rightcode":
+        config["rightcode_text_model"] = str(job.get("provider_text_model") or config["rightcode_text_model"])
+        config["rightcode_image_model"] = str(job.get("provider_image_model") or config["rightcode_image_model"])
+    else:
+        config["text_model"] = str(job.get("provider_text_model") or config["text_model"])
+        config["image_model"] = str(job.get("provider_image_model") or config["image_model"])
+    return config
+
+
+def scene_plan_schema(infographic: bool, item_limit: int) -> dict[str, Any]:
+    if infographic:
+        item_schema: dict[str, Any] = {
+            "type": "object",
+            "properties": {
+                "source_phrase_ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1},
+                "series_title": {"type": "string"},
+                "chapter_title": {"type": "string"},
+                "core_idea": {"type": "string"},
+                "page_title": {"type": "string"},
+                "page_title_trigger_phrase_id": {"type": "integer"},
+                "key_text": {"type": "string"},
+                "role": {"type": "string", "enum": ["overview", "detail", "transition", "summary"]},
+                "layout_type": {"type": "string"},
+                "composition": {"type": "string"},
+                "relationship_type": {"type": "string", "enum": ["none", "sequence", "cause"]},
+                "key_items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "trigger_phrase_id": {"type": "integer"},
+                        },
+                        "required": ["label", "trigger_phrase_id"],
+                        "additionalProperties": False,
+                    },
+                },
+                "conclusion": {"type": "string"},
+                "conclusion_trigger_phrase_id": {"type": "integer"},
+                "visual_strategy": {"type": "string"},
+                "narrative_link": {"type": "string"},
+                "illustration_elements": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
+                "illustration_trigger_phrase_id": {"type": "integer"},
+            },
+            "required": [
+                "source_phrase_ids",
+                "series_title",
+                "chapter_title",
+                "core_idea",
+                "page_title",
+                "page_title_trigger_phrase_id",
+                "key_text",
+                "role",
+                "layout_type",
+                "composition",
+                "relationship_type",
+                "key_items",
+                "conclusion",
+                "conclusion_trigger_phrase_id",
+                "visual_strategy",
+                "narrative_link",
+                "illustration_elements",
+                "illustration_trigger_phrase_id",
+            ],
+            "additionalProperties": False,
+        }
+        return {"type": "array", "items": item_schema, "minItems": 1, "maxItems": max(1, item_limit)}
+    item_schema = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "key_text": {"type": "string"},
+            "concept": {"type": "string"},
+            "elements": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 3},
+            "visual_structure": {"type": "string"},
+            "metaphor": {"type": "string"},
+        },
+        "required": ["title", "key_text", "concept", "elements"],
+        "additionalProperties": False,
+    }
+    exact_count = max(1, item_limit)
+    return {"type": "array", "items": item_schema, "minItems": exact_count, "maxItems": exact_count}
+
+
+def provider_plan_text(
+    config: dict[str, Any],
+    prompt: str,
+    *,
+    infographic: bool,
+    item_limit: int,
+    job_id: str | None = None,
+) -> str:
+    provider = selected_ai_provider(config)
+    if provider == "openlux":
+        payload = provider_post(config, "responses", {"model": config["text_model"], "input": prompt}, job_id=job_id)
+        return extract_response_text(payload)
+    if provider == "rightcode":
+        def on_rightcode_retry(next_attempt: int) -> None:
+            if job_id and job_id in JOBS:
+                ensure_job_active(job_id)
+                update_job(
+                    job_id,
+                    stage=f"Right Code 模型服务暂时异常，正在自动重试 {next_attempt}/3",
+                    model_retry_count=int(JOBS[job_id].get("model_retry_count", 0)) + 1,
+                )
+
+        try:
+            return rightcode_generate_text(
+                str(config.get("rightcode_api_key", "")),
+                str(config.get("rightcode_text_base_url", "")),
+                str(config.get("rightcode_text_model", "")),
+                prompt,
+                retry_callback=on_rightcode_retry,
+            )
+        except RightCodeHTTPError as exc:
+            raise ProviderHTTPError(exc.status_code, str(exc)) from exc
+
+    def on_retry(next_attempt: int) -> None:
+        if job_id and job_id in JOBS:
+            ensure_job_active(job_id)
+            update_job(
+                job_id,
+                stage=f"Gemini 模型服务暂时异常，正在自动重试 {next_attempt}/3",
+                model_retry_count=int(JOBS[job_id].get("model_retry_count", 0)) + 1,
+            )
+
+    try:
+        return gemini_generate_text(
+            str(config.get("gemini_api_key", "")),
+            str(config.get("gemini_text_model", "")),
+            prompt,
+            scene_plan_schema(infographic, item_limit),
+            retry_callback=on_retry,
+        )
+    except GeminiHTTPError as exc:
+        raise ProviderHTTPError(exc.status_code, str(exc)) from exc
 
 def script_units(copy: str) -> list[str]:
     """Use the writer's sentence and paragraph boundaries as semantic units."""
@@ -1034,9 +1313,12 @@ elements 必须是恰好 3 个具体可画的中文短语，按叙事顺序排�
     scenes: list[dict[str, Any]] = []
     last_plan_error: Exception | None = None
     for attempt in range(3):
-        payload = provider_post(config, "responses", {"model": config["text_model"], "input": prompt}, job_id=job_id)
+        plan_text = provider_plan_text(
+            config, prompt, infographic=infographic,
+            item_limit=requested_count if infographic else scene_count, job_id=job_id,
+        )
         try:
-            candidate = parse_json_block(extract_response_text(payload))
+            candidate = parse_json_block(plan_text)
             if not isinstance(candidate, list) or not candidate:
                 raise RuntimeError("分镜模型未返回有效场景")
             if not infographic and len(candidate) != scene_count:
@@ -1103,7 +1385,37 @@ def build_image_prompt(scene: dict[str, Any], style: str) -> str:
 禁止任何文字、字母、数字、Logo、水印、边框、对话框和装饰性填充。画面底部保留约 16% 空白作为字幕安全区。"""
 
 
+def build_memory_handdraw_prompt(
+    scenes: list[dict[str, Any]],
+    reference_instruction: str = "",
+    use_character_references: bool = False,
+) -> str:
+    if len(scenes) != 1:
+        raise ValueError("岁月回忆手绘风必须一幕一图")
+    scene = scenes[0]
+    elements = "、".join(scene.get("elements") or [])
+    reference_block = f"人物参考规则：{reference_instruction}\n" if reference_instruction else ""
+    character_rule = (
+        "如画面出现人物，必须保持参考人物的真实年龄、脸型、发型、服装与标志性特征一致，不得年轻化。"
+        if use_character_references else
+        "人物身份、年龄和关系只能来自原文；不要默认生成年轻讲解者，不得年轻化任何老人。"
+    )
+    return f"""生成一张 16:9 成人口述史微纪录片的彩色手绘母图。
+风格名称：{MEMORY_HANDDRAW_STYLE}。视觉配方：{style_recipe(MEMORY_HANDDRAW_STYLE)}
+{reference_block}{character_rule}
+本幕标题：{scene.get('title', '')}。本幕事件：{scene.get('concept', '')}。
+对应原文：{scene.get('text', '')}。必须出现：{elements}。
+只表现这一幕真实记忆；不得擅自补充年代、地点、人物关系、服装、事件结果或怀旧符号。
+画面必须有清晰、连续、易提取的深灰黑钢笔轮廓；颜色使用低饱和彩铅轻铺，轮廓与色块边界严格对齐，不用模糊光晕和厚涂。
+采用一个主要动作、一个情绪焦点和一至两个环境锚点，镜头克制温暖、复古但不煽情；底部保留约 12% 字幕安全区。
+禁止文字、字母、数字、Logo、水印、边框、多格漫画、摄影写实、3D、霓虹、高饱和和儿童卡通。"""
+
+
 def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False) -> str:
+    if style == MEMORY_HANDDRAW_STYLE:
+        if infographic:
+            raise ValueError("岁月回忆手绘风仅支持标准制作模式")
+        return build_memory_handdraw_prompt(scenes, reference_instruction, use_character_references)
     if infographic:
         scene = scenes[0]
         elements = "、".join(scene.get("illustration_elements") or scene.get("nodes") or [])
@@ -1155,6 +1467,60 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
 
 
 def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_images: list[Path] | None = None, job_id: str | None = None) -> None:
+    provider = selected_ai_provider(config)
+    if provider == "rightcode":
+        def on_rightcode_retry(next_attempt: int) -> None:
+            if job_id and job_id in JOBS:
+                ensure_job_active(job_id)
+                update_job(
+                    job_id,
+                    stage=f"Right Code 图片服务暂时异常，正在自动重试 {next_attempt}/3",
+                    model_retry_count=int(JOBS[job_id].get("model_retry_count", 0)) + 1,
+                )
+
+        def on_rightcode_progress(progress: int) -> None:
+            if job_id and job_id in JOBS:
+                ensure_job_active(job_id)
+                update_job(job_id, stage=f"Right Code GPT Image 2 生成中 {progress}%")
+
+        try:
+            rightcode_generate_image(
+                str(config.get("rightcode_api_key", "")),
+                str(config.get("rightcode_image_base_url", "")),
+                str(config.get("rightcode_task_base_url", "")),
+                str(config.get("rightcode_image_model", "")),
+                prompt,
+                target,
+                list(reference_images or []),
+                retry_callback=on_rightcode_retry,
+                progress_callback=on_rightcode_progress,
+                active_callback=(lambda: ensure_job_active(job_id)) if job_id else None,
+            )
+        except RightCodeHTTPError as exc:
+            raise ProviderHTTPError(exc.status_code, str(exc)) from exc
+        return
+    if provider == "gemini":
+        def on_retry(next_attempt: int) -> None:
+            if job_id and job_id in JOBS:
+                ensure_job_active(job_id)
+                update_job(
+                    job_id,
+                    stage=f"Gemini 图片服务暂时异常，正在自动重试 {next_attempt}/3",
+                    model_retry_count=int(JOBS[job_id].get("model_retry_count", 0)) + 1,
+                )
+
+        try:
+            gemini_generate_image(
+                str(config.get("gemini_api_key", "")),
+                str(config.get("gemini_image_model", "")),
+                prompt,
+                target,
+                list(reference_images or []),
+                retry_callback=on_retry,
+            )
+        except GeminiHTTPError as exc:
+            raise ProviderHTTPError(exc.status_code, str(exc)) from exc
+        return
     # OpenLux documents a 1000-character limit for this GPT Image route.
     compact_prompt = prompt if len(prompt) <= 1000 else f"{prompt[:830]}\n{prompt[-160:]}"
     request_payload = {
@@ -1229,21 +1595,26 @@ def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_
         raise RuntimeError("GPT Image 2 返回格式中没有 b64_json 或 url")
 
 
-def custom_reference_context(job_id: str) -> tuple[list[Path], str, str]:
+def visual_reference_context(job_id: str) -> tuple[list[Path], str, str]:
     with LOCK:
         job = JOBS.get(job_id, {}).copy()
-    if job.get("reference_mode") != "custom":
+    reference_mode = str(job.get("reference_mode") or "standard")
+    if reference_mode not in {"standard", "custom"}:
         return [], "", ""
     job_dir = JOBS_DIR / job_id
     references = job.get("visual_references") or {}
-    style_name = str(references.get("style_image") or "")
-    style_path = job_dir / style_name
-    if not style_name or not valid_image_file(style_path):
-        raise RuntimeError("自定义风格参考图缺失或无效")
-    paths = [style_path]
-    lines = ["输入图1是唯一的画面风格参考，只学习其视觉风格，不复制图中人物。"]
+    paths: list[Path] = []
+    lines: list[str] = []
+    image_index = 1
+    if reference_mode == "custom":
+        style_name = str(references.get("style_image") or "")
+        style_path = job_dir / style_name
+        if not style_name or not valid_image_file(style_path):
+            raise RuntimeError("自定义风格参考图缺失或无效")
+        paths.append(style_path)
+        lines.append("输入图1是唯一的画面风格参考，只学习其视觉风格，不复制图中人物。")
+        image_index = 2
     character_descriptions: list[str] = []
-    image_index = 2
     for character in references.get("characters") or []:
         name = str(character.get("name") or "未命名人物")[:20]
         description = str(character.get("description") or "以参考图外观为准")[:80]
@@ -1259,85 +1630,257 @@ def custom_reference_context(job_id: str) -> tuple[list[Path], str, str]:
         lines.append(f"{range_label}共同定义人物“{name}”：{description}。同名人物在所有分镜保持一致。")
         character_descriptions.append(f"{name}（{description}）")
     if not character_descriptions:
-        raise RuntimeError("没有可用的人物参考图")
+        if reference_mode == "custom":
+            raise RuntimeError("没有可用的人物参考图")
+        return [], "", ""
     return paths, "\n".join(lines), "；".join(character_descriptions)
 
 
-def _synthesize_voice_once(config: dict[str, Any], reference: Path, copy: str, target: Path) -> None:
-    if config.get("tts_mode") == "fastapi":
-        with httpx.Client(timeout=900) as client, reference.open("rb") as audio:
-            response = client.post(
-                f"{config['tts_url'].rstrip('/')}/api/tts",
-                data={"text": copy, "emo_weight": "0.65"},
-                files={"voice": (reference.name, audio, "audio/wav")},
-            )
-            if response.is_error:
-                raise RuntimeError(f"语音克隆失败：{response.status_code} {response.text[:500]}")
-            target.write_bytes(response.content)
-        return
+MINIMAX_CLONE_TTL_SECONDS = 7 * 24 * 60 * 60
 
-    # Long-form cloning can keep the GPU busy for several minutes.  The
-    # default Gradio HTTP read timeout is too short and abandons a healthy job.
-    client = Client(config["tts_url"], verbose=False, httpx_kwargs={"timeout": 1800.0})
-    job = client.submit(
-        "与参考音频的音色相同", handle_file(str(reference)), copy, None, 0.65,
-        0, 0, 0, 0, 0, 0, 0, 0, "", False, 120,
-        True, 0.8, 30, 0.8, 0.0, 3, 10.0, 1500,
-        api_name="/gen_single",
-    )
-    result = job.result(timeout=1800)
-    # Gradio 4/5 may return a filepath string, while newer IndexTTS builds
-    # return FileData as {"path": ..., "url": ...}.
-    item: Any = result
-    # Unwrap tuples/lists and Gradio update objects such as
-    # {"visible": true, "value": {"path": ...}, "__type__": "update"}.
-    while True:
-        if isinstance(item, (list, tuple)) and item:
-            item = item[0]
+
+def reference_audio_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_minimax_voice_cache() -> dict[str, Any]:
+    if not VOICE_CACHE_PATH.exists():
+        return {"version": 1, "voices": {}}
+    try:
+        payload = json.loads(VOICE_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "voices": {}}
+    voices = payload.get("voices")
+    if not isinstance(voices, dict):
+        voices = {}
+    return {"version": 1, "voices": voices}
+
+
+def cached_minimax_voice(audio_hash: str, now: float | None = None) -> dict[str, Any] | None:
+    current_time = time.time() if now is None else now
+    with VOICE_CACHE_LOCK:
+        entry = (_load_minimax_voice_cache().get("voices") or {}).get(audio_hash)
+        if not isinstance(entry, dict) or not str(entry.get("voice_id") or ""):
+            return None
+        if bool(entry.get("activated")):
+            return entry.copy()
+        cloned_at = float(entry.get("cloned_at") or 0)
+        if cloned_at and current_time - cloned_at < MINIMAX_CLONE_TTL_SECONDS:
+            return entry.copy()
+    return None
+
+
+def remember_minimax_voice(
+    audio_hash: str,
+    voice_id: str,
+    *,
+    activated: bool,
+    now: float | None = None,
+    cloned_at: float | None = None,
+) -> None:
+    current_time = time.time() if now is None else now
+    with VOICE_CACHE_LOCK:
+        payload = _load_minimax_voice_cache()
+        voices = payload.setdefault("voices", {})
+        existing = voices.get(audio_hash) if isinstance(voices.get(audio_hash), dict) else {}
+        was_activated = bool(existing.get("activated"))
+        entry = {
+            "voice_id": voice_id,
+            "cloned_at": float(existing.get("cloned_at") or cloned_at or current_time),
+            "activated": was_activated or activated,
+        }
+        if entry["activated"]:
+            entry["activated_at"] = float(existing.get("activated_at") or current_time)
+        voices[audio_hash] = entry
+        STATE_DIR.mkdir(exist_ok=True)
+        VOICE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = VOICE_CACHE_PATH.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(VOICE_CACHE_PATH)
+
+
+def historical_minimax_voice(audio_hash: str, current_job_id: str) -> dict[str, Any] | None:
+    with LOCK:
+        candidates = [
+            (candidate_job_id, item.copy())
+            for candidate_job_id, item in JOBS.items()
+            if candidate_job_id != current_job_id
+            and item.get("minimax_voice_cloned")
+            and item.get("minimax_voice_id")
+        ]
+    candidates.sort(key=lambda item: float(item[1].get("created_at", 0)), reverse=True)
+    current_time = time.time()
+    for candidate_job_id, item in candidates:
+        candidate_hash = str(item.get("reference_audio_sha256") or "")
+        if not candidate_hash:
+            candidate_dir = JOBS_DIR / candidate_job_id
+            candidate_reference = next(iter(sorted(candidate_dir.glob("reference.*"))), None)
+            if candidate_reference is None:
+                continue
+            try:
+                candidate_hash = reference_audio_sha256(candidate_reference)
+            except OSError:
+                continue
+        if candidate_hash != audio_hash:
             continue
-        if isinstance(item, dict) and "value" in item and not item.get("path"):
-            item = item["value"]
+        candidate_dir = JOBS_DIR / candidate_job_id
+        activated = any(
+            path.exists() and path.stat().st_size > 1024
+            for path in (candidate_dir / "voice.wav", candidate_dir / "voice.partial.wav")
+        )
+        cloned_at = float(item.get("created_at") or current_time)
+        if not activated and current_time - cloned_at >= MINIMAX_CLONE_TTL_SECONDS:
             continue
-        break
-    if isinstance(item, dict):
-        path_value = item.get("path")
-        if path_value and Path(path_value).exists():
-            shutil.copy2(Path(path_value), target)
-            return
-        if item.get("url"):
-            with httpx.Client(timeout=300) as http:
-                response = http.get(item["url"])
-                response.raise_for_status()
-                target.write_bytes(response.content)
-            return
-        raise RuntimeError(f"语音服务返回了无法识别的文件对象：{list(item.keys())}")
-    if isinstance(item, (str, os.PathLike)):
-        shutil.copy2(Path(item), target)
-        return
-    raise RuntimeError(f"语音服务返回格式不受支持：{type(item).__name__}")
+        voice_id = str(item["minimax_voice_id"])
+        remember_minimax_voice(
+            audio_hash,
+            voice_id,
+            activated=activated,
+            cloned_at=cloned_at,
+        )
+        return cached_minimax_voice(audio_hash)
+    return None
 
 
-def synthesize_voice(config: dict[str, Any], reference: Path, copy: str, target: Path) -> None:
-    """Retry transient LAN failures while keeping TTS concurrency at one."""
+def reusable_minimax_voice(audio_hash: str, current_job_id: str) -> dict[str, Any] | None:
+    return cached_minimax_voice(audio_hash) or historical_minimax_voice(audio_hash, current_job_id)
+
+
+def minimax_voice_id(config: dict[str, Any], job_id: str) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9_-]", "", str(config.get("minimax_clone_prefix") or "csboard"))
+    prefix = prefix.rstrip("-_") or "csboard"
+    if not prefix[0].isalpha():
+        prefix = f"v{prefix}"
+    return f"{prefix}-{job_id}"[:64].rstrip("-_")
+
+
+def minimax_retryable_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(token in message for token in (
+        "http 429", "http 500", "http 502", "http 503", "http 504",
+        "connection", "connecterror", "timed out", "timeout",
+    ))
+
+
+def _upload_minimax_clone_audio(config: dict[str, Any], reference: Path) -> int:
+    suffix = reference.suffix.lower()
+    if suffix not in {".mp3", ".m4a", ".wav"}:
+        raise RuntimeError("MiniMax 克隆音频只支持 MP3、M4A 或 WAV")
+    if reference.stat().st_size > 20 * 1024 * 1024:
+        raise RuntimeError("MiniMax 克隆音频不能超过 20 MB")
+    mime = mimetypes.guess_type(reference.name)[0] or "application/octet-stream"
+    base_url = str(config.get("minimax_base_url", "")).strip().rstrip("/")
+    with reference.open("rb") as audio, httpx.Client(timeout=180) as client:
+        response = client.post(
+            f"{base_url}/v1/files/upload",
+            headers=minimax_headers(config),
+            data={"purpose": "voice_clone"},
+            files={"file": (reference.name, audio, mime)},
+        )
+    payload = minimax_json(response, "clone audio upload")
+    file_id = (payload.get("file") or {}).get("file_id")
+    if not file_id:
+        raise RuntimeError("MiniMax 上传响应中没有 file_id")
+    return int(file_id)
+
+
+def _clone_minimax_voice_once(config: dict[str, Any], reference: Path, voice_id: str) -> None:
+    base_url = str(config.get("minimax_base_url", "")).strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("MiniMax API 地址不能为空")
+    file_id = _upload_minimax_clone_audio(config, reference)
+    request_payload = {
+        "file_id": file_id,
+        "voice_id": voice_id,
+        "need_noise_reduction": True,
+        "need_volume_normalization": True,
+        "aigc_watermark": False,
+    }
+    with httpx.Client(timeout=180) as client:
+        response = client.post(
+            f"{base_url}/v1/voice_clone",
+            headers=minimax_headers(config),
+            json=request_payload,
+        )
+    minimax_json(response, "voice clone")
+
+
+def clone_minimax_voice(config: dict[str, Any], reference: Path, voice_id: str) -> None:
     last_error: Exception | None = None
-    for attempt in range(4):
+    for attempt in range(3):
         try:
-            _synthesize_voice_once(config, reference, copy, target)
+            _clone_minimax_voice_once(config, reference, voice_id)
             return
         except Exception as exc:
             last_error = exc
-            message = str(exc).lower()
-            retryable = any(token in message for token in ("10061", "connection refused", "connecterror", "timed out"))
-            if not retryable or attempt == 3:
+            if not minimax_retryable_error(exc) or attempt == 2:
+                break
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"MiniMax 音色克隆失败：{last_error or '未知错误'}") from last_error
+
+
+def _synthesize_minimax_voice_once(config: dict[str, Any], copy: str, target: Path, voice_id: str) -> None:
+    if str(config.get("minimax_api_type")) != "t2a_v2":
+        raise RuntimeError("目前只支持 MiniMax T2A v2")
+    base_url = str(config.get("minimax_base_url", "")).strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("MiniMax API 地址不能为空")
+    if not copy.strip() or len(copy) >= 10000:
+        raise RuntimeError("MiniMax 同步语音合成文本必须少于 10000 字符")
+    request_payload = {
+        "model": str(config.get("minimax_speech_model") or "speech-2.8-hd"),
+        "text": copy,
+        "stream": False,
+        "voice_setting": {
+            "voice_id": voice_id,
+            "speed": 1,
+            "vol": 1,
+            "pitch": 0,
+        },
+        "audio_setting": {
+            "sample_rate": 32000,
+            "bitrate": 128000,
+            "format": "wav",
+            "channel": 1,
+        },
+        "language_boost": "Chinese",
+        "subtitle_enable": False,
+        "output_format": "hex",
+        "aigc_watermark": False,
+    }
+    with httpx.Client(timeout=300) as client:
+        response = client.post(
+            f"{base_url}/v1/t2a_v2",
+            headers=minimax_headers(config),
+            json=request_payload,
+        )
+    payload = minimax_json(response, "speech synthesis")
+    audio_hex = str((payload.get("data") or {}).get("audio") or "")
+    if not audio_hex:
+        raise RuntimeError("MiniMax 合成响应中没有音频数据")
+    try:
+        target.write_bytes(bytes.fromhex(audio_hex))
+    except ValueError as exc:
+        raise RuntimeError("MiniMax 返回了无效的十六进制音频数据") from exc
+
+
+def synthesize_voice(config: dict[str, Any], copy: str, target: Path, voice_id: str) -> None:
+    """Use a cloned MiniMax voice and preserve the pipeline's WAV contract."""
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            _synthesize_minimax_voice_once(config, copy, target, voice_id)
+            return
+        except Exception as exc:
+            last_error = exc
+            if not minimax_retryable_error(exc) or attempt == 3:
                 break
             time.sleep(5 * (attempt + 1))
-    raw = str(last_error or "未知错误")
-    if "10061" in raw or "connection refused" in raw.lower():
-        raise RuntimeError(
-            f"无法连接语音克隆服务 {config.get('tts_url', '')}。请确认 IndexTTS 已启动并可从本机访问；系统已自动重试 4 次。"
-        ) from last_error
-    raise RuntimeError(f"语音克隆失败：{raw}") from last_error
-
+    raise RuntimeError(f"MiniMax 语音合成失败：{last_error or '未知错误'}") from last_error
 
 def write_annotation(scene: dict[str, Any], image: Path, target: Path, index: int) -> None:
     from PIL import Image
@@ -1534,6 +2077,37 @@ def remotion_infographic_props(scenes: list[dict[str, Any]], style: str, duratio
     }
 
 
+def remotion_memory_props(boards: list[list[dict[str, Any]]], duration_ms: int) -> dict[str, Any]:
+    fps = 30
+    total_frames = max(1, round(duration_ms * fps / 1000))
+    elapsed_ms = 0
+    memory_scenes: list[dict[str, Any]] = []
+    for index, board in enumerate(boards, 1):
+        scene_duration_ms = sum(int(scene.get("duration_ms") or 0) for scene in board)
+        if scene_duration_ms <= 0:
+            raise RuntimeError(f"第 {index} 个回忆场景缺少有效时长")
+        start_frame = round(elapsed_ms * fps / 1000)
+        elapsed_ms += scene_duration_ms
+        end_frame = total_frames if index == len(boards) else round(elapsed_ms * fps / 1000)
+        memory_scenes.append({
+            "id": f"memory-{index}",
+            "lineImage": f"board-{index:02d}.line.png",
+            "colorImage": f"board-{index:02d}.source.png",
+            "startFrame": start_frame,
+            "endFrame": max(start_frame + 1, end_frame),
+        })
+    return {
+        "compositionId": "MemoryHanddraw",
+        "fps": fps,
+        "width": 1920,
+        "height": 1080,
+        "totalDurationMs": duration_ms,
+        "totalDurationFrames": total_frames,
+        "paperColor": "#f7f2e8",
+        "scenes": memory_scenes,
+    }
+
+
 def fail_job(job_id: str, stage: str, exc: Exception) -> None:
     if isinstance(exc, JobCancelled) or is_job_cancelled(job_id):
         return
@@ -1541,38 +2115,71 @@ def fail_job(job_id: str, stage: str, exc: Exception) -> None:
     update_job(job_id, status="error", stage=stage, error=str(exc))
 
 
-def voice_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str, tts_url: str, node_index: int) -> None:
+def voice_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str, service_url: str, node_index: int) -> None:
     job_dir = JOBS_DIR / job_id
     try:
         config = load_config()
-        config["tts_url"] = tts_url
-        update_job(job_id, tts_node=tts_url, tts_node_index=node_index + 1)
-        begin_phase(job_id, "voice", "语音克隆", f"语音节点 {node_index + 1} 正在克隆声音", 8)
+        config["minimax_base_url"] = service_url
+        with LOCK:
+            job = JOBS.get(job_id, {}).copy()
+        audio_hash = reference_audio_sha256(reference)
+        own_clone_ready = bool(job.get("minimax_voice_cloned") and job.get("minimax_voice_id"))
+        cached_voice = None if own_clone_ready else reusable_minimax_voice(audio_hash, job_id)
+        if own_clone_ready:
+            voice_id = str(job["minimax_voice_id"])
+            clone_ready = True
+            reused_voice = bool(job.get("minimax_voice_reused"))
+        elif cached_voice:
+            voice_id = str(cached_voice["voice_id"])
+            clone_ready = True
+            reused_voice = True
+        else:
+            voice_id = str(job.get("minimax_voice_id") or minimax_voice_id(config, job_id))
+            clone_ready = False
+            reused_voice = False
+        update_job(
+            job_id,
+            voice_provider="MiniMax",
+            voice_service=service_url,
+            minimax_voice_id=voice_id,
+            minimax_voice_cloned=clone_ready,
+            minimax_voice_reused=reused_voice,
+            reference_audio_sha256=audio_hash,
+        )
         voice = job_dir / "voice.wav"
         if not valid_media_file(voice):
+            if not clone_ready:
+                begin_phase(job_id, "voice_clone", "MiniMax 音色克隆", "正在上传首次出现的参考音频并创建克隆音色", 6)
+                clone_minimax_voice(config, reference, voice_id)
+                ensure_job_active(job_id)
+                remember_minimax_voice(audio_hash, voice_id, activated=False)
+                update_job(job_id, minimax_voice_cloned=True)
+            voice_message = "已复用相同参考音频的克隆音色，正在生成完整旁白" if reused_voice else "正在用克隆音色生成完整旁白"
+            begin_phase(job_id, "voice", "MiniMax 语音合成", voice_message, 9)
             partial_voice = job_dir / "voice.partial.wav"
             partial_voice.unlink(missing_ok=True)
-            synthesize_voice(config, reference, copy, partial_voice)
+            synthesize_voice(config, copy, partial_voice, voice_id)
+            remember_minimax_voice(audio_hash, voice_id, activated=True)
             ensure_job_active(job_id)
             if not valid_media_file(partial_voice):
-                raise RuntimeError("语音服务返回的音频文件无效")
+                raise RuntimeError("MiniMax 返回的音频文件无效")
             partial_voice.replace(voice)
+        else:
+            remember_minimax_voice(audio_hash, voice_id, activated=True)
         duration = probe_duration(voice)
         update_job(job_id, duration=duration, checkpoint="voice_done")
         queue_for_stage(job_id, "model", "等待调用模型", 14)
         MODEL_QUEUE.put((job_id, copy, style, reference, scenes_per_image, pen_text, include_key_text, include_subtitles, stroke_detail))
         ensure_pipeline_workers()
     except Exception as exc:
-        fail_job(job_id, "语音克隆失败", exc)
-
-
+        fail_job(job_id, "MiniMax 配音失败", exc)
 def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str) -> None:
     job_dir = JOBS_DIR / job_id
     try:
-        config = load_config()
+        config = model_config_for_job(job_id)
         voice = job_dir / "voice.wav"
         duration = probe_duration(voice)
-        reference_images, reference_instruction, character_context = custom_reference_context(job_id)
+        reference_images, reference_instruction, character_context = visual_reference_context(job_id)
         infographic = is_infographic_job(job_id)
 
         phrase_timeline: dict[str, Any] | None = None
@@ -1674,7 +2281,14 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             board_specs.append((board_images, board_instruction, board_prompt))
         update_job(job_id, duration=duration, scenes=len(scenes), boards=len(boards), checkpoint="plan_done")
         atomic_write_json(job_dir / "boards.json", [
-            {"scene_numbers": list(range(i * scenes_per_image + 1, i * scenes_per_image + len(board) + 1)), "image_prompt": board_specs[i][2]}
+            {
+                "scene_numbers": list(range(i * scenes_per_image + 1, i * scenes_per_image + len(board) + 1)),
+                "image_prompt": board_specs[i][2],
+                **({
+                    "color_image": f"board-{i + 1:02d}.source.png",
+                    "line_image": f"board-{i + 1:02d}.line.png",
+                } if style == MEMORY_HANDDRAW_STYLE else {}),
+            }
             for i, board in enumerate(boards)
         ])
         from scripts.add_key_text import add_key_text
@@ -1685,6 +2299,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             stem = f"board-{i:02d}"
             image = job_dir / f"{stem}.png"
             source_image = job_dir / f"{stem}.source.png"
+            line_image = job_dir / f"{stem}.line.png"
             if not valid_image_file(source_image):
                 partial_image = job_dir / f"{stem}.source.partial.png"
                 last_image_error: Exception | None = None
@@ -1708,8 +2323,18 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
                         time.sleep(provider_retry_delay(attempt))
                 if not valid_image_file(partial_image):
                     raise RuntimeError(f"第 {i} 张分镜图连续 3 次生成无效：{last_image_error}")
+                if style == MEMORY_HANDDRAW_STYLE:
+                    partial_line = job_dir / f"{stem}.line.partial.png"
+                    partial_line.unlink(missing_ok=True)
+                    ensure_memory_lineart_asset(style, partial_image, partial_line)
                 partial_image.replace(source_image)
-            if include_key_text and not infographic:
+                if style == MEMORY_HANDDRAW_STYLE:
+                    partial_line.replace(line_image)
+            if style == MEMORY_HANDDRAW_STYLE and not aligned_image_pair(source_image, line_image):
+                ensure_memory_lineart_asset(style, source_image, line_image)
+            if style == MEMORY_HANDDRAW_STYLE:
+                shutil.copy2(source_image, image)
+            elif include_key_text and not infographic:
                 add_key_text(source_image, [str(scene.get("key_text", "")) for scene in board], image)
             else:
                 shutil.copy2(source_image, image)
@@ -1731,6 +2356,8 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
     job_dir = JOBS_DIR / job_id
     try:
         infographic = is_infographic_job(job_id)
+        style = str(JOBS.get(job_id, {}).get("style") or DEFAULT_STYLE)
+        memory_handdraw = style == MEMORY_HANDDRAW_STYLE
         duration_ms = round(duration * 1000)
         if infographic:
             begin_phase(job_id, "drawing", "Remotion 渲染", "正在按真实旁白时间编排动态信息图", 80)
@@ -1760,6 +2387,31 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                     raise RuntimeError("Remotion 信息图视频时长与真实旁白不一致")
                 partial_silent.replace(silent)
             update_job(job_id, checkpoint="render", completed_videos=len(scenes), render_engine="remotion-semantic-v1")
+        elif memory_handdraw:
+            begin_phase(job_id, "drawing", "Remotion 回忆手绘", "正在按真实旁白时间推进线稿与上色", 80)
+            for index in range(1, len(boards) + 1):
+                color_image = job_dir / f"board-{index:02d}.source.png"
+                line_image = job_dir / f"board-{index:02d}.line.png"
+                if not aligned_image_pair(color_image, line_image):
+                    raise RuntimeError(f"第 {index} 组线稿和彩色图缺失或尺寸不一致")
+            silent = job_dir / "silent-memory-remotion-v1.mp4"
+            final = job_dir / "final-memory-remotion-v1.mp4"
+            if not valid_timed_video(silent, duration_ms):
+                partial_silent = job_dir / "silent-memory-remotion-v1.partial.mp4"
+                partial_silent.unlink(missing_ok=True)
+                props_path = job_dir / "memory-remotion-props.json"
+                atomic_write_json(props_path, remotion_memory_props(boards, duration_ms))
+                run([
+                    str(NODE),
+                    str(REMOTION_RENDERER / "render.mjs"),
+                    str(props_path),
+                    str(partial_silent),
+                    str(job_dir),
+                ], cwd=REMOTION_RENDERER, job_id=job_id)
+                if not valid_timed_video(partial_silent, duration_ms):
+                    raise RuntimeError("Remotion 回忆手绘视频时长与真实旁白不一致")
+                partial_silent.replace(silent)
+            update_job(job_id, checkpoint="render", completed_videos=len(boards), render_engine="remotion-memory-wipe-v1")
         else:
             hand_asset = make_branded_hand(pen_text, job_dir / "hand-branded.png")
             videos: list[Path] = []
@@ -1797,7 +2449,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
         if not valid_media_file(final):
             partial_final = job_dir / f"{final.stem}.partial.mp4"
             partial_final.unlink(missing_ok=True)
-            ffmpeg_command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", silent.name, "-i", "voice.wav", "-map", "0:v:0", "-map", "1:a:0"]
+            ffmpeg_command = [str(FFMPEG), "-y", "-hide_banner", "-loglevel", "error", "-i", silent.name, "-i", "voice.wav", "-map", "0:v:0", "-map", "1:a:0"]
             if include_subtitles:
                 subtitles = job_dir / "subtitles.srt"
                 write_subtitles(scenes, subtitles)
@@ -1823,6 +2475,12 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
         if fit_scene_durations(scenes, duration):
             atomic_write_json(job_dir / "plan.json", scenes)
         boards = [scenes[i:i + scenes_per_image] for i in range(0, len(scenes), scenes_per_image)]
+        style = str(JOBS.get(job_id, {}).get("style") or DEFAULT_STYLE)
+        if style == MEMORY_HANDDRAW_STYLE:
+            (job_dir / "silent-memory-remotion-v1.mp4").unlink(missing_ok=True)
+            (job_dir / "final-memory-remotion-v1.mp4").unlink(missing_ok=True)
+            render_generated_job(job_id, scenes, boards, pen_text, include_subtitles, stroke_detail, duration)
+            return
         hand_asset = make_branded_hand(pen_text, job_dir / "hand-branded.png")
         from scripts.add_key_text import add_key_text
         videos: list[Path] = []
@@ -1867,7 +2525,7 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
         if not valid_media_file(final):
             partial_final = job_dir / "final.partial.mp4"
             partial_final.unlink(missing_ok=True)
-            ffmpeg_command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", "silent.mp4", "-i", "voice.wav", "-map", "0:v:0", "-map", "1:a:0"]
+            ffmpeg_command = [str(FFMPEG), "-y", "-hide_banner", "-loglevel", "error", "-i", "silent.mp4", "-i", "voice.wav", "-map", "0:v:0", "-map", "1:a:0"]
             if include_subtitles:
                 subtitles = job_dir / "subtitles.srt"
                 write_subtitles(scenes, subtitles)
@@ -1886,7 +2544,7 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
 
 def voice_queue_worker(node_index: int) -> None:
     while True:
-        nodes = configured_tts_nodes()
+        nodes = configured_voice_services()
         if node_index >= len(nodes):
             time.sleep(1)
             continue
@@ -1897,7 +2555,7 @@ def voice_queue_worker(node_index: int) -> None:
                 should_run = JOBS.get(job_id, {}).get("status") in {"queued", "running"}
             if not should_run:
                 continue
-            nodes = configured_tts_nodes()
+            nodes = configured_voice_services()
             if node_index >= len(nodes):
                 VOICE_QUEUE.put(task)
                 time.sleep(1)
@@ -1942,9 +2600,9 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
             raise RuntimeError(f"第 {page} 张图片不存在")
 
         begin_phase(job_id, "images", "单图重生成", f"正在按修改后的提示词重新生成第 {page} 张图片", 50)
-        config = load_config()
+        config = model_config_for_job(job_id)
         board = boards[page - 1]
-        reference_images, _reference_instruction, _character_context = custom_reference_context(source_id)
+        reference_images, _reference_instruction, _character_context = visual_reference_context(source_id)
         style = str(source.get("style") or DEFAULT_STYLE)
         if style == PAPER_METAPHOR_STYLE and not reference_images:
             reference_images, _reference_instruction = paper_metaphor_reference_context(board)
@@ -1954,6 +2612,7 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
         stem = f"board-{page:02d}"
         image = job_dir / f"{stem}.png"
         source_image = job_dir / f"{stem}.source.png"
+        line_image = job_dir / f"{stem}.line.png"
         partial_image = job_dir / f"{stem}.source.partial.png"
         last_error: Exception | None = None
         for attempt in range(3):
@@ -1976,15 +2635,23 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
                 time.sleep(provider_retry_delay(attempt))
         if not valid_image_file(partial_image):
             raise RuntimeError(f"第 {page} 张图片连续 3 次生成无效：{last_error}")
+        partial_line = job_dir / f"{stem}.line.partial.png"
+        if style == MEMORY_HANDDRAW_STYLE:
+            partial_line.unlink(missing_ok=True)
+            ensure_memory_lineart_asset(style, partial_image, partial_line)
 
         revision_dir = job_dir / "revisions" / time.strftime("%Y%m%d-%H%M%S")
         revision_dir.mkdir(parents=True, exist_ok=True)
-        for previous in (source_image, image, boards_path):
+        for previous in (source_image, line_image, image, boards_path):
             if previous.exists():
                 shutil.copy2(previous, revision_dir / previous.name)
         partial_image.replace(source_image)
+        if style == MEMORY_HANDDRAW_STYLE:
+            partial_line.replace(line_image)
         include_key_text = bool(selected.get("include_key_text", source.get("include_key_text", True)))
-        if include_key_text and not is_infographic_job(job_id):
+        if style == MEMORY_HANDDRAW_STYLE:
+            shutil.copy2(source_image, image)
+        elif include_key_text and not is_infographic_job(job_id):
             from scripts.add_key_text import add_key_text
             add_key_text(source_image, [str(scene.get("key_text", "")) for scene in board], image)
         else:
@@ -2003,6 +2670,9 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
                 "image_prompt": "",
             })
         manifest[page - 1]["image_prompt"] = prompt
+        if style == MEMORY_HANDDRAW_STYLE:
+            manifest[page - 1]["color_image"] = source_image.name
+            manifest[page - 1]["line_image"] = line_image.name
         atomic_write_json(boards_path, manifest)
         finish_timing(job_id)
         update_job(
@@ -2064,7 +2734,7 @@ def start_render_task(target: Any, *args: Any) -> None:
 
 def ensure_pipeline_workers() -> None:
     with WORKER_LOCK:
-        for index, _url in enumerate(configured_tts_nodes()):
+        for index, _url in enumerate(configured_voice_services()):
             thread = VOICE_WORKER_THREADS.get(index)
             if thread is None or not thread.is_alive():
                 thread = threading.Thread(target=voice_queue_worker, args=(index,), name=f"voice-worker-{index + 1}", daemon=True)
@@ -2090,7 +2760,7 @@ def enqueue_job_from_checkpoint(job_id: str, item: dict[str, Any]) -> None:
         MODEL_QUEUE.put(("regenerate_board", job_id, page, prompt))
         return
     result_name = str(item.get("result_file") or "final.mp4")
-    if result_name not in {"final.mp4", "final-remotion-v1.mp4"}:
+    if result_name not in VIDEO_RESULT_FILES:
         result_name = "final.mp4"
     if valid_media_file(job_dir / result_name):
         finish_timing(job_id)
@@ -2157,14 +2827,18 @@ resume_pending_jobs()
 def health() -> dict[str, Any]:
     with RENDER_THREADS_LOCK:
         render_active = sum(1 for thread in RENDER_THREADS if thread.is_alive())
-    nodes = configured_tts_nodes()
+    nodes = configured_voice_services()
     with VOICE_NODE_LOCK:
         voice_nodes = [
             {"index": index + 1, "url": url, "active": bool(VOICE_NODE_JOBS.get(index)), "job_id": VOICE_NODE_JOBS.get(index)}
             for index, url in enumerate(nodes)
         ]
     return {
-        "status": "ok", "pipeline_version": PIPELINE_VERSION, "renderer": PYTHON.exists(), "tts": nodes,
+        "status": "ok",
+        "pipeline_version": PIPELINE_VERSION,
+        "renderer": PYTHON.exists(),
+        "voice_provider": "MiniMax",
+        "tts": nodes,
         "queues": {
             "voice": {"concurrency": len(nodes), "waiting": VOICE_QUEUE.qsize(), "nodes": voice_nodes},
             "model": {"concurrency": MODEL_CONCURRENCY, "waiting": MODEL_QUEUE.qsize()},
@@ -2185,11 +2859,15 @@ def save_config(payload: dict[str, Any]) -> dict[str, Any]:
         value = payload.get(key)
         if key == "api_key" and isinstance(value, str) and "••••" in value:
             continue
-        if key == "tts_url_2" and isinstance(value, str):
-            current[key] = value.strip()
+        if key == "gemini_api_key" and isinstance(value, str) and value == "********":
+            continue
+        if key == "rightcode_api_key" and isinstance(value, str) and value == "********":
+            continue
+        if key == "minimax_api_key" and isinstance(value, str) and value == "********":
             continue
         if value not in (None, ""):
-            current[key] = value
+            current[key] = value.strip() if isinstance(value, str) else value
+    current["ai_provider"] = selected_ai_provider(current)
     STATE_DIR.mkdir(exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
     ensure_pipeline_workers()
@@ -2200,12 +2878,129 @@ def save_config(payload: dict[str, Any]) -> dict[str, Any]:
 def test_config(payload: dict[str, Any]) -> dict[str, Any]:
     config = load_config()
     for key, value in payload.items():
-        if key not in DEFAULT_CONFIG or (key == "api_key" and isinstance(value, str) and "••••" in value):
+        if key not in DEFAULT_CONFIG:
             continue
-        if key == "tts_url_2" and isinstance(value, str):
-            config[key] = value.strip()
-        elif value:
-            config[key] = value
+        if key == "api_key" and isinstance(value, str) and "••••" in value:
+            continue
+        if key == "gemini_api_key" and isinstance(value, str) and value == "********":
+            continue
+        if key == "rightcode_api_key" and isinstance(value, str) and value == "********":
+            continue
+        if key == "minimax_api_key" and isinstance(value, str) and value == "********":
+            continue
+        if value:
+            config[key] = value.strip() if isinstance(value, str) else value
+    if selected_ai_provider(config) == "rightcode":
+        results: dict[str, Any] = {}
+        try:
+            text_result = rightcode_generate_text(
+                str(config.get("rightcode_api_key", "")),
+                str(config.get("rightcode_text_base_url", "")),
+                str(config.get("rightcode_text_model", "")),
+                "只回复：连接成功",
+                timeout=60,
+            )
+            if not text_result.strip():
+                raise RuntimeError("Right Code 文本模型未返回内容")
+            results["provider"] = {
+                "ok": True,
+                "message": f"Right Code {config['rightcode_text_model']} 连接成功",
+            }
+        except Exception as exc:
+            results["provider"] = {"ok": False, "message": str(exc)}
+        try:
+            models = rightcode_list_models(
+                str(config.get("rightcode_api_key", "")),
+                str(config.get("rightcode_image_base_url", "")),
+            )
+            image_model = str(config.get("rightcode_image_model", ""))
+            if models and image_model not in models:
+                raise RuntimeError(f"当前 Right Code Key 的画图模型列表中没有 {image_model}")
+            results["image"] = {
+                "ok": True,
+                "message": f"Right Code {image_model} 已可用（未生成计费图片）",
+            }
+        except RightCodeHTTPError as exc:
+            if exc.status_code in {404, 405}:
+                results["image"] = {
+                    "ok": True,
+                    "message": f"Right Code {config['rightcode_image_model']} 将在首次生成时验证（未生成计费图片）",
+                }
+            else:
+                results["image"] = {"ok": False, "message": str(exc)}
+        except Exception as exc:
+            results["image"] = {"ok": False, "message": str(exc)}
+        try:
+            base_url = str(config.get("minimax_base_url", "")).strip().rstrip("/")
+            if not base_url:
+                raise RuntimeError("MiniMax API 地址不能为空")
+            with httpx.Client(timeout=20) as client:
+                response = client.post(
+                    f"{base_url}/v1/get_voice",
+                    headers=minimax_headers(config),
+                    json={"voice_type": "all"},
+                )
+            minimax_json(response, "voice list")
+            results["tts"] = {
+                "ok": True,
+                "message": "MiniMax 鉴权与音色接口连接成功（未发起计费克隆）",
+            }
+        except Exception as exc:
+            results["tts"] = {"ok": False, "message": str(exc)}
+        return results
+    if selected_ai_provider(config) == "gemini":
+        results: dict[str, Any] = {}
+        try:
+            text_result = gemini_generate_text(
+                str(config.get("gemini_api_key", "")),
+                str(config.get("gemini_text_model", "")),
+                '只返回 {"status":"ok"}',
+                {
+                    "type": "object",
+                    "properties": {"status": {"type": "string"}},
+                    "required": ["status"],
+                    "additionalProperties": False,
+                },
+                timeout=60,
+            )
+            parsed_result = json.loads(text_result)
+            if not isinstance(parsed_result, dict) or not parsed_result.get("status"):
+                raise RuntimeError("Gemini 文本模型未返回预期的结构化结果")
+            results["provider"] = {
+                "ok": True,
+                "message": f"Gemini {config['gemini_text_model']} 连接成功",
+            }
+        except Exception as exc:
+            results["provider"] = {"ok": False, "message": str(exc)}
+        try:
+            gemini_get_model(
+                str(config.get("gemini_api_key", "")),
+                str(config.get("gemini_image_model", "")),
+            )
+            results["image"] = {
+                "ok": True,
+                "message": f"Gemini {config['gemini_image_model']} 已可用（未生成计费图片）",
+            }
+        except Exception as exc:
+            results["image"] = {"ok": False, "message": str(exc)}
+        try:
+            base_url = str(config.get("minimax_base_url", "")).strip().rstrip("/")
+            if not base_url:
+                raise RuntimeError("MiniMax API 地址不能为空")
+            with httpx.Client(timeout=20) as client:
+                response = client.post(
+                    f"{base_url}/v1/get_voice",
+                    headers=minimax_headers(config),
+                    json={"voice_type": "all"},
+                )
+            minimax_json(response, "voice list")
+            results["tts"] = {
+                "ok": True,
+                "message": "MiniMax 鉴权与音色接口连接成功（未发起计费克隆）",
+            }
+        except Exception as exc:
+            results["tts"] = {"ok": False, "message": str(exc)}
+        return results
     results: dict[str, Any] = {}
     try:
         provider_post(config, "responses", {"model": config["text_model"], "input": "只回复：连接成功"}, timeout=60)
@@ -2220,20 +3015,24 @@ def test_config(payload: dict[str, Any]) -> dict[str, Any]:
         results["image"] = {"ok": True, "message": f"{image_model} 已可用" if models else f"{image_model} 将在生成时验证"}
     except Exception as exc:
         results["image"] = {"ok": False, "message": str(exc)}
-    tts_results: list[dict[str, Any]] = []
-    for index, url in enumerate(configured_tts_nodes(config), 1):
-        try:
-            check = f"{url}/gradio_api/info" if config.get("tts_mode") == "gradio" else f"{url}/api/health"
-            response = httpx.get(check, timeout=8)
-            response.raise_for_status()
-            tts_results.append({"index": index, "url": url, "ok": True, "message": f"语音节点 {index} 连接成功"})
-        except Exception as exc:
-            tts_results.append({"index": index, "url": url, "ok": False, "message": f"语音节点 {index} 连接失败：{exc}"})
-    tts_ok = bool(tts_results) and all(item["ok"] for item in tts_results)
-    results["tts_nodes"] = tts_results
-    results["tts"] = {"ok": tts_ok, "message": "；".join(str(item["message"]) for item in tts_results) or "未配置语音节点"}
+    try:
+        base_url = str(config.get("minimax_base_url", "")).strip().rstrip("/")
+        if not base_url:
+            raise RuntimeError("MiniMax API 地址不能为空")
+        with httpx.Client(timeout=20) as client:
+            response = client.post(
+                f"{base_url}/v1/get_voice",
+                headers=minimax_headers(config),
+                json={"voice_type": "all"},
+            )
+        minimax_json(response, "voice list")
+        results["tts"] = {
+            "ok": True,
+            "message": "MiniMax 鉴权与音色接口连接成功（未发起计费克隆）",
+        }
+    except Exception as exc:
+        results["tts"] = {"ok": False, "message": str(exc)}
     return results
-
 
 @app.get("/api/preferences")
 def get_preferences() -> dict[str, Any]:
@@ -2278,6 +3077,12 @@ async def create_job(
 ) -> dict[str, Any]:
     if len(script.strip()) < 10:
         raise HTTPException(400, "文案至少需要 10 个字")
+    if style == MEMORY_HANDDRAW_STYLE:
+        if reference_mode != "standard":
+            raise HTTPException(400, "岁月回忆手绘风仅支持标准制作模式")
+        scenes_per_image = 1
+        if not MEMORY_HANDDRAW_PIPELINE_ENABLED:
+            raise HTTPException(409, "岁月回忆手绘风正在完成线稿与渐进上色渲染模块，暂不可提交任务")
     with LOCK:
         pending = sum(1 for item in JOBS.values() if item.get("status") in {"queued", "running"})
     if pending >= MAX_ACTIVE_AND_QUEUED:
@@ -2285,22 +3090,40 @@ async def create_job(
     job_id = uuid.uuid4().hex[:12]
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(reference.filename or "reference.wav").suffix or ".wav"
+    suffix = (Path(reference.filename or "reference.wav").suffix or ".wav").lower()
+    if suffix not in {".mp3", ".m4a", ".wav"}:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, "MiniMax 克隆音频只支持 MP3、M4A 或 WAV")
     reference_path = job_dir / f"reference{suffix}"
     with reference_path.open("wb") as target:
         shutil.copyfileobj(reference.file, target)
+    if reference_path.stat().st_size > 20 * 1024 * 1024:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, "MiniMax 克隆音频不能超过 20 MB")
+    if Path(FFPROBE).exists() or shutil.which(FFPROBE):
+        try:
+            reference_duration = probe_duration(reference_path)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(400, "参考音频无效，无法读取时长")
+        if not 10 <= reference_duration <= 300:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(400, "MiniMax 克隆音频时长必须在 10 秒至 5 分钟之间")
     reference_mode = reference_mode if reference_mode in {"custom", "infographic"} else "standard"
     visual_references: dict[str, Any] = {}
-    if reference_mode == "custom":
+    if reference_mode == "custom" or character_references or character_manifest.strip() not in {"", "[]"}:
         uploads = character_references or []
         try:
             manifest = json.loads(character_manifest)
         except json.JSONDecodeError as exc:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(400, "人物参考信息格式无效") from exc
-        if style_reference is None or not isinstance(manifest, list) or not 1 <= len(manifest) <= 5:
+        if not isinstance(manifest, list) or not 1 <= len(manifest) <= 5:
             shutil.rmtree(job_dir, ignore_errors=True)
-            raise HTTPException(400, "自定义参考需要 1 张风格图和 1–5 个人物")
+            raise HTTPException(400, "人物参考需要填写 1–5 个人物")
+        if reference_mode == "custom" and style_reference is None:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(400, "自定义参考需要上传 1 张风格图")
         try:
             counts = [int(item.get("file_count", 0)) for item in manifest if isinstance(item, dict)]
         except (TypeError, ValueError) as exc:
@@ -2313,13 +3136,15 @@ async def create_job(
         if expected != len(uploads) or expected < 1 or expected > 15:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(400, "人物参考图片数量不匹配")
-        style_suffix = Path(style_reference.filename or "style.png").suffix.lower()
-        if style_suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            raise HTTPException(400, "风格参考图只支持 PNG、JPG 或 WebP")
-        style_path = job_dir / f"style-reference{style_suffix}"
-        with style_path.open("wb") as target:
-            shutil.copyfileobj(style_reference.file, target)
+        style_path: Path | None = None
+        if style_reference is not None:
+            style_suffix = Path(style_reference.filename or "style.png").suffix.lower()
+            if style_suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise HTTPException(400, "风格参考图只支持 PNG、JPG 或 WebP")
+            style_path = job_dir / f"style-reference{style_suffix}"
+            with style_path.open("wb") as target:
+                shutil.copyfileobj(style_reference.file, target)
         saved_characters: list[dict[str, Any]] = []
         cursor = 0
         for character_index, item in enumerate(manifest, 1):
@@ -2346,20 +3171,24 @@ async def create_job(
                 "description": str(item.get("description") or "").strip()[:80],
                 "images": image_names,
             })
-        if style_path.stat().st_size > 15 * 1024 * 1024 or not valid_image_file(style_path):
+        if style_path is not None and (style_path.stat().st_size > 15 * 1024 * 1024 or not valid_image_file(style_path)):
             shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(400, "风格参考图无效或超过 15MB")
-        visual_references = {"style_image": style_path.name, "characters": saved_characters}
+        visual_references = {"characters": saved_characters}
+        if style_path is not None:
+            visual_references["style_image"] = style_path.name
     scenes_per_image = max(1, min(4, scenes_per_image))
     stroke_detail = stroke_detail if stroke_detail in {"light", "standard", "detailed", "full"} else "detailed"
     task_name = normalized_task_name(task_name, script, job_id)
+    provider_snapshot = provider_job_snapshot(load_config())
     now = time.time()
     with LOCK:
         JOBS[job_id] = {
-            "id": job_id, "status": "queued", "stage": "等待语音克隆", "progress": 1,
+            "id": job_id, "status": "queued", "stage": "等待 MiniMax 音色克隆", "progress": 1,
             "created_at": now, "started_at": now, "timings": {},
             "queue_stage": "voice", "queue_order": time.time_ns(),
             "client_ip": request_client_ip(request),
+            **provider_snapshot,
             "job_type": "infographic" if reference_mode == "infographic" else "generate", "style": style, "scenes_per_image": scenes_per_image,
             "pipeline_version": PIPELINE_VERSION if reference_mode == "infographic" else "standard_v1",
             "reference_mode": reference_mode, "character_count": len(visual_references.get("characters", [])),
@@ -2369,6 +3198,7 @@ async def create_job(
             "pen_text": pen_text.strip()[:12], "include_key_text": include_key_text,
             "include_subtitles": include_subtitles,
             "stroke_detail": stroke_detail, "can_rerender": False,
+            "minimax_voice_cloned": False,
             "current_phase": None, "phase_started_at": None, "total_elapsed": 0.0,
         }
         _persist_job_locked(job_id)
@@ -2691,7 +3521,7 @@ def download_job(job_id: str) -> FileResponse:
     if not item:
         raise HTTPException(404, "任务不存在")
     result_name = str(item.get("result_file") or "final.mp4")
-    if result_name not in {"final.mp4", "final-remotion-v1.mp4"}:
+    if result_name not in VIDEO_RESULT_FILES:
         raise HTTPException(404, "视频文件记录无效")
     path = JOBS_DIR / job_id / result_name
     if not path.exists():

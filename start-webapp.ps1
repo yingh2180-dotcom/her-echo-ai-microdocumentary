@@ -8,11 +8,28 @@ $backendOutputLog = Join-Path $stateDir "backend-output.log"
 $backendErrorLog = Join-Path $stateDir "backend-error.log"
 $frontendOutputLog = Join-Path $stateDir "frontend-output.log"
 $frontendErrorLog = Join-Path $stateDir "frontend-error.log"
-$expectedPipelineVersion = "narrated_deck_v8_oil_visual"
+$expectedPipelineVersion = "narrated_deck_v11_memory_remotion"
 $backendUpdateDeferred = $false
 
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 Remove-Item -LiteralPath $launcherErrorLog -Force -ErrorAction SilentlyContinue
+
+function Update-ProcessPath {
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $pathParts = @($machinePath, $userPath) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $env:Path = $pathParts -join ";"
+}
+
+function Assert-MediaTools {
+    Update-ProcessPath
+    foreach ($tool in @("ffmpeg", "ffprobe")) {
+        if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+            throw "Media tool '$tool' is installed but not available to the launcher. Reopen PowerShell or reinstall FFmpeg."
+        }
+    }
+}
 
 function Test-BackendReady {
     if ($script:backendUpdateDeferred) {
@@ -72,6 +89,7 @@ try {
         Write-Host "LAN URL: http://${lanAddress}:13000" -ForegroundColor Green
     }
 
+    Assert-MediaTools
     Stop-StaleBackend
     if (Test-BackendReady) {
         if ($backendUpdateDeferred) {

@@ -30,6 +30,7 @@ video_renderer/dist/
 
 # Runtime media and local projects
 assets/whiteboard/
+work/backups/
 *.wav
 *.mp3
 *.m4a

@@ -66,3 +66,22 @@ export type InfographicVideoProps = {
   subtitlesEnabled?: boolean;
   pages: InfographicPage[];
 };
+
+export type MemoryHanddrawScene = {
+  id: string;
+  lineImage: string;
+  colorImage: string;
+  startFrame: number;
+  endFrame: number;
+};
+
+export type MemoryHanddrawVideoProps = {
+  compositionId?: 'MemoryHanddraw';
+  fps: number;
+  width: number;
+  height: number;
+  totalDurationMs: number;
+  totalDurationFrames: number;
+  paperColor?: string;
+  scenes: MemoryHanddrawScene[];
+};

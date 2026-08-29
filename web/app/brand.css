@@ -162,6 +162,26 @@
   margin-top: 4px;
 }
 
+.characterReferenceSection {
+  margin-top: 20px;
+  padding-top: 2px;
+  border-top: 1px solid #d8cfbd80;
+}
+
+.referenceBuilder + .characterReferenceSection {
+  margin-top: 14px;
+}
+
+.characterHeading em {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #efe5d6;
+  color: var(--muted);
+  font-size: 9px;
+  font-style: normal;
+}
+
 .visualDrop,
 .characterUpload {
   position: relative;
